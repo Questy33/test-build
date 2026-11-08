@@ -5,6 +5,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,6 +21,23 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Ensure permanent signing keystore
+        run: |
+          if [ ! -f "keystore.jks" ]; then
+            keytool -genkeypair -v \
+              -keystore keystore.jks \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias appkey \
+              -storepass android123 -keypass android123 \
+              -dname "CN=WifiClock, OU=Dev, O=App, L=City, S=State, C=UA"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add keystore.jks
+            git commit -m "Lock permanent APK signing key"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
 
       - name: Generate Android project structure
         run: |
@@ -72,8 +92,21 @@ jobs:
                   applicationId "com.example.nettracker"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
+              }
+              signingConfigs {
+                  debug {
+                      storeFile file("../keystore.jks")
+                      storePassword "android123"
+                      keyAlias "appkey"
+                      keyPassword "android123"
+                  }
+              }
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.debug
+                  }
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
