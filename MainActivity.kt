@@ -287,7 +287,6 @@ class MainActivity : Activity() {
             setPadding(0, 0, 14, 0)
         }
 
-        // Светлый фон специально для спиннера и выпадающего списка архива дат
         val spinnerBg = GradientDrawable().apply {
             setColor(Color.parseColor("#CBD5E1"))
             cornerRadius = 12f
@@ -363,7 +362,6 @@ class MainActivity : Activity() {
             if (idx == 0) "$rawDate (Сегодня)" else rawDate
         }
 
-        // Кастомный адаптер со светлым фоном и тёмным текстом для архива дат
         val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, displayNames) {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val v = super.getView(position, convertView, parent) as TextView
@@ -458,10 +456,20 @@ class DashboardChartView(context: Context) : View(context) {
         textAlign = Paint.Align.RIGHT
         isFakeBoldText = true
     }
-    private val centerTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#94A3B8")
+    private val centerStatusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
+    }
+
+    // Контур и заливка для активной часовой стрелки
+    private val handOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#090D16")
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val handOutlineCirclePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#090D16")
+        style = Paint.Style.FILL
     }
     private val handPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -492,10 +500,8 @@ class DashboardChartView(context: Context) : View(context) {
                 cal.get(Calendar.MINUTE) * 60 +
                 cal.get(Calendar.SECOND)
 
-        // Ограничение прошедшего времени: для сегодня — до текущей секунды, для прошлых дней — полные 24ч
         val elapsedSec = if (isToday) nowSec.coerceIn(0, 86400) else 86400
 
-        // Считаем суммарное время ON за день
         var totalOnSec = 0
         for (pair in intervals) {
             val s = pair[0].coerceIn(0, elapsedSec)
@@ -517,11 +523,9 @@ class DashboardChartView(context: Context) : View(context) {
 
         val headerY = topAreaHeight * 0.24f
 
-        // Статус ON / OFF без лишних слов
         statusPaint.color = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
         canvas.drawText(if (isOnNow) "● ON" else "● OFF", barLeft, headerY, statusPaint)
 
-        // Итоговая статистика за день отображается ТОЛЬКО после полного окончания 24 часов (!isToday)
         if (!isToday) {
             val onH = totalOnSec / 3600
             val onM = (totalOnSec % 3600) / 60
@@ -535,18 +539,15 @@ class DashboardChartView(context: Context) : View(context) {
         val barTop = topAreaHeight * 0.36f
         val barBottom = topAreaHeight * 0.68f
 
-        // Фоновая дорожка 0..24
         rect.set(barLeft, barTop, barRight, barBottom)
         canvas.drawRoundRect(rect, 8f, 8f, trackPaint)
 
-        // Красным рисуем выключенное время (вся прошедшая часть суток по умолчанию красная)
         if (elapsedSec > 0) {
             val elapsedRight = barLeft + (elapsedSec / 86400f) * barWidth
             rect.set(barLeft, barTop, elapsedRight, barBottom)
             canvas.drawRect(rect, redOffPaint)
         }
 
-        // Поверх красного рисуем зелёным включённое время (ON)
         for (pair in intervals) {
             val x1 = barLeft + (pair[0] / 86400f) * barWidth
             val x2 = barLeft + (pair[1] / 86400f) * barWidth
@@ -556,7 +557,6 @@ class DashboardChartView(context: Context) : View(context) {
             }
         }
 
-        // Почасовая шкала от 0 до 24
         val tickBottom = barBottom + (topAreaHeight * 0.08f)
         val textY = tickBottom + labelPaint.textSize * 1.05f
         for (hour in 0..24) {
@@ -566,13 +566,12 @@ class DashboardChartView(context: Context) : View(context) {
             tickPaint.color = if (isMajor) Color.parseColor("#94A3B8") else Color.parseColor("#475569")
             canvas.drawLine(x, barBottom, x, tickBottom, tickPaint)
 
-            // Подписываем каждый час на широком экране или чётные часы на узком
             if (w >= 700f || hour % 2 == 0) {
                 canvas.drawText(hour.toString(), x, textY, labelPaint)
             }
         }
 
-        // ================= 2. ДВА КРУГЛЫХ ЧАСОВЫХ ГРАФИКА (0..12) РЯДОМ =================
+        // ================= 2. ДВА КРУГЛЫХ ЧАСОВЫХ ГРАФИКА РЯДОМ =================
         val bottomTop = topAreaHeight + 8f
         val bottomHeight = h - bottomTop
         val halfW = w / 2f
@@ -580,7 +579,7 @@ class DashboardChartView(context: Context) : View(context) {
         val isFirstHalfActive = isToday && (nowSec < 43200)
         val isSecondHalfActive = isToday && (nowSec >= 43200)
 
-        // Левые часы: 00:00 – 12:00
+        // Левые часы (разметка 1..12)
         drawClockDial(
             canvas = canvas,
             cx = halfW * 0.5f,
@@ -589,12 +588,12 @@ class DashboardChartView(context: Context) : View(context) {
             availableH = bottomHeight,
             periodStartSec = 0,
             periodEndSec = 43200,
-            periodLabel = "00:00 – 12:00",
+            isSecondHalf = false,
             isActiveClock = isFirstHalfActive,
             nowSec = nowSec
         )
 
-        // Правые часы: 12:00 – 24:00
+        // Правые часы (разметка 13..24)
         drawClockDial(
             canvas = canvas,
             cx = halfW * 1.5f,
@@ -603,7 +602,7 @@ class DashboardChartView(context: Context) : View(context) {
             availableH = bottomHeight,
             periodStartSec = 43200,
             periodEndSec = 86400,
-            periodLabel = "12:00 – 24:00",
+            isSecondHalf = true,
             isActiveClock = isSecondHalfActive,
             nowSec = nowSec
         )
@@ -617,7 +616,7 @@ class DashboardChartView(context: Context) : View(context) {
         availableH: Float,
         periodStartSec: Int,
         periodEndSec: Int,
-        periodLabel: String,
+        isSecondHalf: Boolean,
         isActiveClock: Boolean,
         nowSec: Int
     ) {
@@ -629,14 +628,14 @@ class DashboardChartView(context: Context) : View(context) {
         ringBgPaint.strokeWidth = strokeW
         greenArcPaint.strokeWidth = strokeW
         labelPaint.textSize = (minDim * 0.045f).coerceIn(18f, 34f)
-        centerTitlePaint.textSize = (minDim * 0.048f).coerceIn(18f, 36f)
+        centerStatusPaint.textSize = (minDim * 0.052f).coerceIn(20f, 38f)
 
         arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
 
-        // Фоновое тёмное кольцо (выключенное время красным здесь НЕ рисуем)
+        // Тёмное базовое кольцо
         canvas.drawOval(arcRect, ringBgPaint)
 
-        // Зелёные дуги подключенного состояния (ON) для этой 12-часовой половины
+        // Зелёные дуги ON
         for (pair in intervals) {
             val s = max(pair[0], periodStartSec)
             val e = min(pair[1], periodEndSec)
@@ -647,12 +646,11 @@ class DashboardChartView(context: Context) : View(context) {
             }
         }
 
-        // Тонкая подсветка контура активного циферблата
         if (isActiveClock) {
             canvas.drawCircle(cx, cy, radius + strokeW * 0.56f, activeRingBorderPaint)
         }
 
-        // Деления и цифры часов от 0 до 12
+        // Деления и цифры: 1..12 на левом, 13..24 на правом
         val innerR = radius - strokeW / 2f
         val outerR = radius + strokeW / 2f
         val textR = outerR + strokeW * 0.55f
@@ -673,37 +671,48 @@ class DashboardChartView(context: Context) : View(context) {
                 tickPaint
             )
 
-            val hourStr = if (h == 0) "12" else h.toString()
+            val hourStr = if (!isSecondHalf) {
+                if (h == 0) "12" else h.toString()
+            } else {
+                if (h == 0) "24" else (h + 12).toString()
+            }
+
             val textOffsetY = (labelPaint.descent() + labelPaint.ascent()) / 2f
             canvas.drawText(hourStr, cx + textR * cosA, cy + textR * sinA - textOffsetY, labelPaint)
         }
 
-        // Подпись половины суток (00:00–12:00 или 12:00–24:00)
-        canvas.drawText(periodLabel, cx, cy + radius * 0.42f, centerTitlePaint)
-
-        // Активная стрелка часов (только на активном циферблате)
+        // Активная стрелка с тёмной обводкой (контуром), чтобы не сливалась с зелёной шкалой
         if (isActiveClock) {
             val localSec = (nowSec - periodStartSec).coerceIn(0, 43200)
             val handDeg = -90.0 + (localSec / 43200.0) * 360.0
             val handRad = Math.toRadians(handDeg)
 
             val handColor = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
+            val handWidth = (strokeW * 0.24f).coerceIn(7f, 15f)
+            val outlineExtra = (strokeW * 0.16f).coerceIn(5f, 10f)
+            val centerRadius = (strokeW * 0.32f).coerceIn(10f, 18f)
+
+            handOutlinePaint.strokeWidth = handWidth + outlineExtra
             handPaint.color = handColor
-            handPaint.strokeWidth = (strokeW * 0.22f).coerceIn(6f, 14f)
+            handPaint.strokeWidth = handWidth
             handCenterPaint.color = handColor
 
-            val handLength = radius - strokeW * 0.15f
+            // Кончик стрелки заходит на середину кольца, а тёмный контур отделяет её от зелёной дуги
+            val handLength = radius
             val tipX = cx + handLength * cos(handRad).toFloat()
             val tipY = cy + handLength * sin(handRad).toFloat()
 
-            // Стрелка от центра к текущей отметке времени на кольце
-            canvas.drawLine(cx, cy, tipX, tipY, handPaint)
-            canvas.drawCircle(cx, cy, (strokeW * 0.32f).coerceIn(9f, 18f), handCenterPaint)
+            // Статус ON / OFF внутри активного циферблата
+            centerStatusPaint.color = handColor
+            canvas.drawText(if (isOnNow) "ON" else "OFF", cx, cy - radius * 0.32f, centerStatusPaint)
 
-            // Статус ON / OFF над центром активного графика
-            centerTitlePaint.color = handColor
-            canvas.drawText(if (isOnNow) "ON" else "OFF", cx, cy - radius * 0.28f, centerTitlePaint)
-            centerTitlePaint.color = Color.parseColor("#94A3B8")
+            // 1. Рисуем тёмный контур стрелки и центрального кружка
+            canvas.drawLine(cx, cy, tipX, tipY, handOutlinePaint)
+            canvas.drawCircle(cx, cy, centerRadius + outlineExtra * 0.55f, handOutlineCirclePaint)
+
+            // 2. Рисуем саму цветную стрелку поверх тёмного контура
+            canvas.drawLine(cx, cy, tipX, tipY, handPaint)
+            canvas.drawCircle(cx, cy, centerRadius, handCenterPaint)
         }
     }
 }
