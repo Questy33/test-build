@@ -633,3 +633,487 @@ class MainActivity : Activity() {
         }
 
         daySpinner.adapter = adapter
+        daySpinner.setSelection(days.indexOf(selectedDayKey).coerceAtLeast(0))
+
+        daySpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                selectedDayKey = days[pos]
+                updateDashboard(
+                    WifiStorage.isConnected(this@MainActivity),
+                    selectedDayKey == WifiStorage.getTodayKey()
+                )
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        updateDashboard(isOn, selectedDayKey == todayKey)
+    }
+
+    private fun updateDashboard(isOn: Boolean, isToday: Boolean) {
+        val dayIntervals = WifiStorage.getIntervalsForDay(this, selectedDayKey)
+        val rolling11h = WifiStorage.getRolling11hIntervals(this, selectedDayKey, isToday)
+        val stateDurationSec = WifiStorage.getCurrentStateDurationSec(this, isOn)
+        dashboardView.setData(dayIntervals, rolling11h, isOn, isToday, stateDurationSec)
+    }
+}
+
+class DashboardChartView(context: Context) : View(context) {
+    private data class BarSegment(val startSec: Int, val endSec: Int, val isOn: Boolean)
+
+    private var dayIntervals: List<IntArray> = emptyList()
+    private var rollingIntervals: List<IntArray> = emptyList()
+    private var isOnNow: Boolean = false
+    private var isToday: Boolean = true
+    private var currentStateDurationSec: Int = 0
+
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1E293B")
+        style = Paint.Style.FILL
+    }
+    private val redOffPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#EF4444")
+        style = Paint.Style.FILL
+    }
+    private val greenOnPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#10B981")
+        style = Paint.Style.FILL
+    }
+    private val segDividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0F172A")
+        strokeWidth = 2f
+    }
+    private val segTextOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0F172A")
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+        isFakeBoldText = true
+    }
+    private val segTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.FILL
+        isFakeBoldText = true
+    }
+    private val whiteNowMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val ringBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1E293B")
+        style = Paint.Style.STROKE
+    }
+    private val activeRingBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#334155")
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
+    private val fadingArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.BUTT
+    }
+    private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#64748B")
+        strokeWidth = 2.5f
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#CBD5E1")
+        textAlign = Paint.Align.CENTER
+    }
+    private val statsPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E2E8F0")
+        textAlign = Paint.Align.RIGHT
+        isFakeBoldText = true
+    }
+
+    private val centerTimeOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0F172A")
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+        isFakeBoldText = true
+    }
+    private val centerTimePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#F8FAFC")
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.FILL
+        isFakeBoldText = true
+    }
+
+    private val stateDurOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0F172A")
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+        isFakeBoldText = true
+    }
+    private val stateDurPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        style = Paint.Style.FILL
+        isFakeBoldText = true
+    }
+
+    private val handOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#090D16")
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val handOutlineCirclePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#090D16")
+        style = Paint.Style.FILL
+    }
+    private val handPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val handCenterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+
+    private val rect = RectF()
+    private val arcRect = RectF()
+
+    fun setData(
+        newDayIntervals: List<IntArray>,
+        newRollingIntervals: List<IntArray>,
+        connected: Boolean,
+        todayFlag: Boolean,
+        stateDurationSec: Int
+    ) {
+        dayIntervals = newDayIntervals
+        rollingIntervals = newRollingIntervals
+        isOnNow = connected
+        isToday = todayFlag
+        currentStateDurationSec = stateDurationSec
+        invalidate()
+    }
+
+    // Формирует последовательность всех зелёных (ON) и красных (OFF) отрезков за прошедшую часть суток
+    private fun buildContiguousSegments(elapsedSec: Int): List<BarSegment> {
+        if (elapsedSec <= 0) return emptyList()
+        val result = mutableListOf<BarSegment>()
+        var cursor = 0
+
+        for (pair in dayIntervals) {
+            val s = pair[0].coerceIn(0, elapsedSec)
+            val e = pair[1].coerceIn(0, elapsedSec)
+            if (e <= s) continue
+
+            if (s > cursor) {
+                result.add(BarSegment(cursor, s, isOn = false))
+            }
+            if (result.isNotEmpty() && result.last().isOn) {
+                val prev = result.removeAt(result.lastIndex)
+                result.add(BarSegment(prev.startSec, max(prev.endSec, e), isOn = true))
+            } else {
+                result.add(BarSegment(s, e, isOn = true))
+            }
+            cursor = max(cursor, e)
+        }
+
+        if (cursor < elapsedSec) {
+            result.add(BarSegment(cursor, elapsedSec, isOn = false))
+        }
+        return result
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+
+        val cal = Calendar.getInstance()
+        val hourNow = cal.get(Calendar.HOUR_OF_DAY)
+        val minNow = cal.get(Calendar.MINUTE)
+        val secNow = cal.get(Calendar.SECOND)
+        val nowSec = hourNow * 3600 + minNow * 60 + secNow
+
+        val elapsedSec = if (isToday) nowSec.coerceIn(0, 86400) else 86400
+        val segments = buildContiguousSegments(elapsedSec)
+
+        var totalOnSec = 0
+        for (seg in segments) {
+            if (seg.isOn) totalOnSec += (seg.endSec - seg.startSec)
+        }
+        val totalOffSec = (elapsedSec - totalOnSec).coerceAtLeast(0)
+
+        // ================= 1. ВЕРХНИЙ ПРЯМОЛИНЕЙНЫЙ ГРАФИК (0..24) =================
+        val topAreaHeight = h * 0.28f
+        val padX = (w * 0.03f).coerceAtLeast(24f)
+        val barLeft = padX
+        val barRight = w - padX
+        val barWidth = (barRight - barLeft).coerceAtLeast(100f)
+
+        statsPaint.textSize = (topAreaHeight * 0.13f).coerceIn(18f, 30f)
+        labelPaint.textSize = (topAreaHeight * 0.12f).coerceIn(17f, 28f)
+
+        // Статистика в 2 строки за прошлые дни без фразы "24ч итог"
+        if (!isToday) {
+            val onH = totalOnSec / 3600
+            val onM = (totalOnSec % 3600) / 60
+            val offH = totalOffSec / 3600
+            val offM = (totalOffSec % 3600) / 60
+            val onPct = ((totalOnSec / 86400f) * 100f + 0.5f).toInt().coerceIn(0, 100)
+            val offPct = 100 - onPct
+
+            val line1Y = topAreaHeight * 0.15f
+            val line2Y = topAreaHeight * 0.31f
+
+            statsPaint.color = Color.parseColor("#10B981")
+            canvas.drawText("ON: ${onH}ч ${onM}м ($onPct%)", barRight, line1Y, statsPaint)
+
+            statsPaint.color = Color.parseColor("#EF4444")
+            canvas.drawText("OFF: ${offH}ч ${offM}м ($offPct%)", barRight, line2Y, statsPaint)
+        }
+
+        val barTop = topAreaHeight * 0.38f
+        val barBottom = topAreaHeight * 0.72f
+        val barHeight = barBottom - barTop
+
+        rect.set(barLeft, barTop, barRight, barBottom)
+        canvas.drawRoundRect(rect, 8f, 8f, trackPaint)
+
+        // Рисуем все отрезки (красные и зелёные)
+        for (seg in segments) {
+            val x1 = barLeft + (seg.startSec / 86400f) * barWidth
+            val x2 = barLeft + (seg.endSec / 86400f) * barWidth
+            if (x2 > x1) {
+                rect.set(x1, barTop, max(x2, x1 + 2f), barBottom)
+                canvas.drawRect(rect, if (seg.isOn) greenOnPaint else redOffPaint)
+                if (seg.startSec > 0) {
+                    canvas.drawLine(x1, barTop, x1, barBottom, segDividerPaint)
+                }
+            }
+        }
+
+        // Подписи длительности ("Xч Yм") внутри каждого временного отрезка верхнего графика
+        val baseSegTextSize = (barHeight * 0.44f).coerceIn(14f, 24f)
+        for (seg in segments) {
+            val durSec = seg.endSec - seg.startSec
+            val durMinTotal = durSec / 60
+            if (durMinTotal < 1) continue
+
+            val x1 = barLeft + (seg.startSec / 86400f) * barWidth
+            val x2 = barLeft + (seg.endSec / 86400f) * barWidth
+            val segW = x2 - x1
+            if (segW < 14f) continue
+
+            val dH = durSec / 3600
+            val dM = (durSec % 3600) / 60
+
+            val fullLabel = "${dH}ч ${dM}м"
+            val compactLabel = if (dH > 0) "${dH}ч${dM}м" else "${dM}м"
+
+            segTextPaint.textSize = baseSegTextSize
+            var chosenLabel = fullLabel
+            var textW = segTextPaint.measureText(chosenLabel)
+
+            // Если полная строка широковата для отрезка, берём компактную и при необходимости уменьшаем шрифт
+            if (textW > segW - 6f) {
+                chosenLabel = compactLabel
+                textW = segTextPaint.measureText(chosenLabel)
+                if (textW > segW - 4f && textW > 0f) {
+                    val scaledSize = (baseSegTextSize * ((segW - 4f) / textW)).coerceAtLeast(11f)
+                    segTextPaint.textSize = scaledSize
+                }
+            }
+
+            segTextOutlinePaint.textSize = segTextPaint.textSize
+            segTextOutlinePaint.strokeWidth = (segTextPaint.textSize * 0.24f).coerceAtLeast(4f)
+
+            val centerX = (x1 + x2) * 0.5f
+            val centerY = (barTop + barBottom) * 0.5f - (segTextPaint.descent() + segTextPaint.ascent()) * 0.5f
+
+            if (segTextPaint.measureText(chosenLabel) <= segW + 2f) {
+                canvas.drawText(chosenLabel, centerX, centerY, segTextOutlinePaint)
+                canvas.drawText(chosenLabel, centerX, centerY, segTextPaint)
+            } else if (barHeight >= 28f && segW >= 14f) {
+                // Для совсем узких отрезков поворачиваем подпись вертикально внутри полосы
+                canvas.save()
+                canvas.rotate(-90f, centerX, (barTop + barBottom) * 0.5f)
+                val rotY = (barTop + barBottom) * 0.5f - (segTextPaint.descent() + segTextPaint.ascent()) * 0.5f
+                canvas.drawText(chosenLabel, centerX, rotY, segTextOutlinePaint)
+                canvas.drawText(chosenLabel, centerX, rotY, segTextPaint)
+                canvas.restore()
+            }
+        }
+
+        // Белая чёрточка текущего положения времени на верхнем графике
+        if (isToday) {
+            val nowX = barLeft + (nowSec / 86400f) * barWidth
+            val underlineY = barBottom + 5f
+            val halfDash = (barWidth * 0.012f).coerceIn(8f, 18f)
+
+            whiteNowMarkerPaint.strokeWidth = 4.5f
+            canvas.drawLine(nowX - halfDash, underlineY, nowX + halfDash, underlineY, whiteNowMarkerPaint)
+            canvas.drawLine(nowX, barTop - 3f, nowX, underlineY, whiteNowMarkerPaint)
+        }
+
+        val tickBottom = barBottom + (topAreaHeight * 0.08f)
+        val textY = tickBottom + labelPaint.textSize * 1.05f
+        for (hour in 0..24) {
+            val x = barLeft + (hour / 24f) * barWidth
+            val isMajor = hour % 6 == 0
+            tickPaint.strokeWidth = if (isMajor) 3.5f else 2f
+            tickPaint.color = if (isMajor) Color.parseColor("#94A3B8") else Color.parseColor("#475569")
+            canvas.drawLine(x, barBottom, x, tickBottom, tickPaint)
+
+            if (w >= 700f || hour % 2 == 0) {
+                canvas.drawText(hour.toString(), x, textY, labelPaint)
+            }
+        }
+
+        // ================= 2. НИЖНИЕ КРУГЛЫЕ ЧАСЫ (0..12) =================
+        val bottomTop = topAreaHeight + 8f
+        val bottomHeight = h - bottomTop
+        val time24Str = String.format(Locale.US, "%02d:%02d", hourNow, minNow)
+
+        val stateH = currentStateDurationSec / 3600
+        val stateM = (currentStateDurationSec % 3600) / 60
+        val stateDurStr = "${stateH}ч ${stateM}м"
+
+        drawSingleClockDial(
+            canvas = canvas,
+            cx = w * 0.5f,
+            cy = bottomTop + bottomHeight * 0.51f,
+            availableW = w,
+            availableH = bottomHeight,
+            nowSec = nowSec,
+            time24Str = time24Str,
+            stateDurStr = stateDurStr
+        )
+    }
+
+    private fun drawSingleClockDial(
+        canvas: Canvas,
+        cx: Float,
+        cy: Float,
+        availableW: Float,
+        availableH: Float,
+        nowSec: Int,
+        time24Str: String,
+        stateDurStr: String
+    ) {
+        val minDim = min(availableW, availableH)
+        val strokeW = (minDim * 0.11f).coerceIn(22f, 64f)
+        val radius = (minDim * 0.5f) - strokeW * 1.40f
+        if (radius <= 20f) return
+
+        ringBgPaint.strokeWidth = strokeW
+        fadingArcPaint.strokeWidth = strokeW
+        labelPaint.textSize = (minDim * 0.045f).coerceIn(18f, 36f)
+
+        arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
+        canvas.drawOval(arcRect, ringBgPaint)
+
+        // Последние 11 часов с плавным угасанием цвета
+        val windowDuration = 11 * 3600
+        val refSec = if (isToday) nowSec else 86400
+        val windowStart = refSec - windowDuration
+        val stepSec = 60
+
+        for (pair in rollingIntervals) {
+            val s = max(pair[0], windowStart)
+            val e = min(pair[1], refSec)
+            if (e <= s) continue
+
+            var cur = s
+            while (cur < e) {
+                val next = min(cur + stepSec, e)
+                val mid = (cur + next) * 0.5f
+                val ageSec = (refSec - mid).coerceIn(0f, windowDuration.toFloat())
+                val freshness = 1f - (ageSec / windowDuration.toFloat())
+
+                val weight = 0.12f + 0.88f * freshness
+                val r = (30 + (16 - 30) * weight).toInt()
+                val g = (41 + (185 - 41) * weight).toInt()
+                val b = (59 + (129 - 59) * weight).toInt()
+                fadingArcPaint.color = Color.rgb(r, g, b)
+
+                val dialSec = ((cur % 43200) + 43200) % 43200
+                val startAngle = -90f + (dialSec / 43200f) * 360f
+                val sweepAngle = ((next - cur) / 43200f) * 360f
+
+                canvas.drawArc(arcRect, startAngle, max(sweepAngle, 0.65f), false, fadingArcPaint)
+                cur = next
+            }
+        }
+
+        canvas.drawCircle(cx, cy, radius + strokeW * 0.56f, activeRingBorderPaint)
+
+        val innerR = radius - strokeW / 2f
+        val outerR = radius + strokeW / 2f
+        val textR = outerR + strokeW * 0.55f
+
+        for (h in 0 until 12) {
+            val deg = -90.0 + h * 30.0
+            val rad = Math.toRadians(deg)
+            val cosA = cos(rad).toFloat()
+            val sinA = sin(rad).toFloat()
+
+            tickPaint.strokeWidth = if (h % 3 == 0) 4f else 2f
+            tickPaint.color = if (h % 3 == 0) Color.parseColor("#94A3B8") else Color.parseColor("#334155")
+            canvas.drawLine(
+                cx + innerR * cosA,
+                cy + innerR * sinA,
+                cx + outerR * cosA,
+                cy + outerR * sinA,
+                tickPaint
+            )
+
+            val hourStr = if (h == 0) "12" else h.toString()
+            val textOffsetY = (labelPaint.descent() + labelPaint.ascent()) / 2f
+            canvas.drawText(hourStr, cx + textR * cosA, cy + textR * sinA - textOffsetY, labelPaint)
+        }
+
+        // Активная стрелка с тёмным контуром
+        if (isToday) {
+            val localSec = nowSec % 43200
+            val handDeg = -90.0 + (localSec / 43200.0) * 360.0
+            val handRad = Math.toRadians(handDeg)
+
+            val handColor = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
+            val handWidth = (strokeW * 0.24f).coerceIn(7f, 15f)
+            val outlineExtra = (strokeW * 0.16f).coerceIn(5f, 10f)
+            val centerRadius = (strokeW * 0.32f).coerceIn(10f, 18f)
+
+            handOutlinePaint.strokeWidth = handWidth + outlineExtra
+            handPaint.color = handColor
+            handPaint.strokeWidth = handWidth
+            handCenterPaint.color = handColor
+
+            val handLength = radius
+            val tipX = cx + handLength * cos(handRad).toFloat()
+            val tipY = cy + handLength * sin(handRad).toFloat()
+
+            canvas.drawLine(cx, cy, tipX, tipY, handOutlinePaint)
+            canvas.drawCircle(cx, cy, centerRadius + outlineExtra * 0.55f, handOutlineCirclePaint)
+
+            canvas.drawLine(cx, cy, tipX, tipY, handPaint)
+            canvas.drawCircle(cx, cy, centerRadius, handCenterPaint)
+        }
+
+        // 1. Актуальное время в 24ч формате (в верхней половине внутри часов)
+        val timeTextSize = (radius * 0.27f).coerceIn(26f, 62f)
+        centerTimePaint.textSize = timeTextSize
+        centerTimeOutlinePaint.textSize = timeTextSize
+        centerTimeOutlinePaint.strokeWidth = (timeTextSize * 0.22f).coerceAtLeast(8f)
+
+        val timeY = cy - radius * 0.34f
+        canvas.drawText(time24Str, cx, timeY, centerTimeOutlinePaint)
+        canvas.drawText(time24Str, cx, timeY, centerTimePaint)
+
+        // 2. Длительность текущего состояния (зелёным ч и м если включено, красным если выключено)
+        val durTextSize = (radius * 0.22f).coerceIn(22f, 50f)
+        stateDurPaint.textSize = durTextSize
+        stateDurPaint.color = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
+        stateDurOutlinePaint.textSize = durTextSize
+        stateDurOutlinePaint.strokeWidth = (durTextSize * 0.24f).coerceAtLeast(7f)
+
+        val durY = cy + radius * 0.44f
+        canvas.drawText(stateDurStr, cx, durY, stateDurOutlinePaint)
+        canvas.drawText(stateDurStr, cx, durY, stateDurPaint)
+    }
+}
