@@ -33,7 +33,19 @@ import kotlin.math.sin
 object WifiStorage {
     private const val PREFS_NAME = "wifi_clock_history"
     private const val KEY_ACTIVE_START = "active_wifi_start"
-    private val dayFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+
+    // Порог склеивания случайных обрывов: до 120 секунд (2 минуты) обрыв игнорируется
+    private const val MERGE_GAP_SEC = 120
+    // Минимальная длительность завершённого включения (случайные всплески короче 60 сек отсеиваются)
+    private const val MIN_VALID_BLIP_SEC = 60
+
+    private fun formatDay(timeMs: Long): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        sdf.timeZone = TimeZone.getDefault()
+        return "day_" + sdf.format(Date(timeMs))
+    }
+
+    fun getTodayKey(): String = formatDay(System.currentTimeMillis())
 
     fun isConnected(context: Context): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -69,7 +81,7 @@ object WifiStorage {
 
         while (cursor < endMs) {
             cal.timeInMillis = cursor
-            val dayKey = "day_" + dayFormat.format(cal.time)
+            val dayKey = formatDay(cursor)
 
             cal.set(Calendar.HOUR_OF_DAY, 0)
             cal.set(Calendar.MINUTE, 0)
@@ -88,20 +100,20 @@ object WifiStorage {
             val endSec = ((segEnd - dayStartMs) / 1000L).toInt().coerceIn(0, 86400)
 
             if (endSec > startSec) {
-                val list = loadDayIntervals(prefs, dayKey).toMutableList()
-                if (list.isNotEmpty() && startSec - list.last()[1] <= 5) {
-                    list.last()[1] = maxOf(list.last()[1], endSec)
+                val rawList = loadRawDayIntervals(prefs, dayKey).toMutableList()
+                if (rawList.isNotEmpty() && startSec - rawList.last()[1] <= MERGE_GAP_SEC) {
+                    rawList.last()[1] = maxOf(rawList.last()[1], endSec)
                 } else {
-                    list.add(intArrayOf(startSec, endSec))
+                    rawList.add(intArrayOf(startSec, endSec))
                 }
-                editor.putString(dayKey, serializeIntervals(list))
+                editor.putString(dayKey, serializeIntervals(rawList))
             }
             cursor = segEnd
         }
         editor.apply()
     }
 
-    fun loadDayIntervals(prefs: android.content.SharedPreferences, dayKey: String): List<IntArray> {
+    private fun loadRawDayIntervals(prefs: android.content.SharedPreferences, dayKey: String): List<IntArray> {
         val raw = prefs.getString(dayKey, null) ?: return emptyList()
         val result = mutableListOf<IntArray>()
         return try {
@@ -118,6 +130,38 @@ object WifiStorage {
         }
     }
 
+    // Возвращает сглаженные интервалы без минутных обрывов и случайных секундных всплесков
+    fun loadDayIntervals(prefs: android.content.SharedPreferences, dayKey: String): List<IntArray> {
+        val raw = loadRawDayIntervals(prefs, dayKey)
+        if (raw.isEmpty()) return emptyList()
+
+        val isToday = (dayKey == getTodayKey())
+        val cal = Calendar.getInstance()
+        val nowSec = cal.get(Calendar.HOUR_OF_DAY) * 3600 +
+                cal.get(Calendar.MINUTE) * 60 +
+                cal.get(Calendar.SECOND)
+
+        // 1. Склеиваем интервалы, между которыми разрыв не более MERGE_GAP_SEC (2 минут)
+        val merged = mutableListOf<IntArray>()
+        for (pair in raw) {
+            val s = pair[0]
+            val e = pair[1]
+            if (merged.isNotEmpty() && s - merged.last()[1] <= MERGE_GAP_SEC) {
+                merged.last()[1] = maxOf(merged.last()[1], e)
+            } else {
+                merged.add(intArrayOf(s, e))
+            }
+        }
+
+        // 2. Убираем случайные короткие всплески (< 60 сек), кроме текущего идущего подключения или переходов на границе суток
+        return merged.filter { pair ->
+            val duration = pair[1] - pair[0]
+            val touchesMidnight = (pair[0] == 0 || pair[1] >= 86400)
+            val isCurrentlyActive = isToday && (nowSec - pair[1] <= MERGE_GAP_SEC)
+            duration >= MIN_VALID_BLIP_SEC || touchesMidnight || isCurrentlyActive
+        }
+    }
+
     private fun serializeIntervals(list: List<IntArray>): String {
         val root = JSONArray()
         for (pair in list) {
@@ -131,7 +175,7 @@ object WifiStorage {
 
     fun getAvailableDays(context: Context): List<String> {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val today = "day_" + dayFormat.format(Date())
+        val today = getTodayKey()
         val keys = prefs.all.keys.filter { it.startsWith("day_") }.toMutableSet()
         keys.add(today)
         return keys.sortedDescending()
@@ -140,6 +184,132 @@ object WifiStorage {
     fun getIntervalsForDay(context: Context, dayKey: String): List<IntArray> {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return loadDayIntervals(prefs, dayKey)
+    }
+
+    fun getTotalOnSecondsForDay(context: Context, dayKey: String): Int {
+        val intervals = getIntervalsForDay(context, dayKey)
+        val isToday = (dayKey == getTodayKey())
+        val cal = Calendar.getInstance()
+        val maxSec = if (isToday) {
+            (cal.get(Calendar.HOUR_OF_DAY) * 3600 +
+                    cal.get(Calendar.MINUTE) * 60 +
+                    cal.get(Calendar.SECOND)).coerceIn(0, 86400)
+        } else 86400
+
+        var total = 0
+        for (pair in intervals) {
+            val s = pair[0].coerceIn(0, maxSec)
+            val e = pair[1].coerceIn(0, maxSec)
+            if (e > s) total += (e - s)
+        }
+        return total
+    }
+
+    // Вычисляет длительность текущего состояния (ON или OFF) в секундах с учётом перехода через полночь
+    fun getCurrentStateDurationSec(context: Context, isOnNow: Boolean): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val cal = Calendar.getInstance()
+        val nowSec = (cal.get(Calendar.HOUR_OF_DAY) * 3600 +
+                cal.get(Calendar.MINUTE) * 60 +
+                cal.get(Calendar.SECOND)).coerceIn(0, 86400)
+
+        val todayKey = getTodayKey()
+        val todayIntervals = loadDayIntervals(prefs, todayKey)
+
+        if (isOnNow) {
+            var totalOn = 0
+            if (todayIntervals.isNotEmpty()) {
+                val last = todayIntervals.last()
+                if (nowSec - last[1] <= MERGE_GAP_SEC) {
+                    totalOn += (nowSec - last[0]).coerceAtLeast(0)
+                    if (last[0] > MERGE_GAP_SEC) return totalOn
+                } else {
+                    return 0
+                }
+            } else {
+                return 0
+            }
+
+            // Если подключение началось ещё вчера (до 00:00), прибавляем хвост предыдущих суток
+            cal.set(Calendar.HOUR_OF_DAY, 0)
+            cal.set(Calendar.MINUTE, 0)
+            cal.set(Calendar.SECOND, 0)
+            cal.set(Calendar.MILLISECOND, 0)
+            var dayStartMs = cal.timeInMillis
+
+            for (back in 1..7) {
+                dayStartMs -= 86400_000L
+                val prevKey = formatDay(dayStartMs)
+                val prevIntervals = loadDayIntervals(prefs, prevKey)
+                if (prevIntervals.isEmpty()) break
+                val lastPrev = prevIntervals.last()
+                if (86400 - lastPrev[1] <= MERGE_GAP_SEC) {
+                    totalOn += (86400 - lastPrev[0]).coerceAtLeast(0)
+                    if (lastPrev[0] > MERGE_GAP_SEC) break
+                } else {
+                    break
+                }
+            }
+            return totalOn
+        } else {
+            // Сейчас OFF — считаем, сколько прошло с конца последнего ON
+            if (todayIntervals.isNotEmpty()) {
+                val lastEnd = todayIntervals.last()[1]
+                return (nowSec - lastEnd).coerceAtLeast(0)
+            }
+
+            var totalOff = nowSec
+            cal.set(Calendar.HOUR_OF_DAY, 0)
+            cal.set(Calendar.MINUTE, 0)
+            cal.set(Calendar.SECOND, 0)
+            cal.set(Calendar.MILLISECOND, 0)
+            var dayStartMs = cal.timeInMillis
+
+            for (back in 1..7) {
+                dayStartMs -= 86400_000L
+                val prevKey = formatDay(dayStartMs)
+                if (!prefs.contains(prevKey)) break
+                val prevIntervals = loadDayIntervals(prefs, prevKey)
+                if (prevIntervals.isNotEmpty()) {
+                    val lastEnd = prevIntervals.last()[1]
+                    totalOff += (86400 - lastEnd).coerceAtLeast(0)
+                    break
+                } else {
+                    totalOff += 86400
+                }
+            }
+            return totalOff
+        }
+    }
+
+    fun getRolling11hIntervals(context: Context, selectedDayKey: String, isToday: Boolean): List<IntArray> {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!isToday) {
+            return loadDayIntervals(prefs, selectedDayKey)
+        }
+
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        val yesterdayKey = formatDay(cal.timeInMillis - 12L * 3600L * 1000L)
+
+        val yesterdayList = loadDayIntervals(prefs, yesterdayKey)
+        val todayList = loadDayIntervals(prefs, selectedDayKey)
+
+        val combined = mutableListOf<IntArray>()
+        for (pair in yesterdayList) {
+            combined.add(intArrayOf(pair[0] - 86400, pair[1] - 86400))
+        }
+        for (pair in todayList) {
+            if (combined.isNotEmpty() && pair[0] - combined.last()[1] <= MERGE_GAP_SEC) {
+                combined.last()[1] = maxOf(combined.last()[1], pair[1])
+            } else {
+                combined.add(intArrayOf(pair[0], pair[1]))
+            }
+        }
+        return combined
     }
 
     @Synchronized
@@ -170,19 +340,29 @@ class NetMonitorService : Service() {
     private lateinit var cm: ConnectivityManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Отложенная фиксация разрыва, чтобы секундные провалы связи не дёргали базу
+    private val disconnectDebounceRunnable = Runnable {
+        val stillConnected = WifiStorage.isConnected(applicationContext)
+        WifiStorage.syncState(applicationContext, stillConnected)
+    }
+
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            mainHandler.removeCallbacks(disconnectDebounceRunnable)
             WifiStorage.syncState(applicationContext)
         }
 
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
             val isOn = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-            WifiStorage.syncState(applicationContext, isOn)
+            if (isOn) {
+                mainHandler.removeCallbacks(disconnectDebounceRunnable)
+                WifiStorage.syncState(applicationContext, true)
+            }
         }
 
         override fun onLost(network: Network) {
-            WifiStorage.syncState(applicationContext)
-            mainHandler.postDelayed({ WifiStorage.syncState(applicationContext) }, 600)
+            mainHandler.removeCallbacks(disconnectDebounceRunnable)
+            mainHandler.postDelayed(disconnectDebounceRunnable, 3000L)
         }
     }
 
@@ -228,6 +408,7 @@ class NetMonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(disconnectDebounceRunnable)
         WifiStorage.syncState(this)
         try { cm.unregisterNetworkCallback(netCallback) } catch (_: Exception) {}
         super.onDestroy()
@@ -240,15 +421,23 @@ class MainActivity : Activity() {
     private lateinit var dashboardView: DashboardChartView
     private lateinit var daySpinner: Spinner
     private var selectedDayKey: String = ""
+    private var lastObservedTodayKey: String = ""
     private val uiHandler = Handler(Looper.getMainLooper())
 
     private val tickRunnable = object : Runnable {
         override fun run() {
             WifiStorage.syncState(this@MainActivity)
-            val days = WifiStorage.getAvailableDays(this@MainActivity)
-            val isToday = selectedDayKey.isEmpty() || selectedDayKey == days.first()
-            updateDashboard(WifiStorage.isConnected(this@MainActivity), isToday)
-            uiHandler.postDelayed(this, 15000L)
+            val currentToday = WifiStorage.getTodayKey()
+
+            if (currentToday != lastObservedTodayKey) {
+                lastObservedTodayKey = currentToday
+                selectedDayKey = currentToday
+                refreshUI()
+            } else {
+                val isToday = selectedDayKey == currentToday
+                updateDashboard(WifiStorage.isConnected(this@MainActivity), isToday)
+            }
+            uiHandler.postDelayed(this, 1000L)
         }
     }
 
@@ -331,8 +520,14 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        val currentToday = WifiStorage.getTodayKey()
+        if (lastObservedTodayKey != currentToday) {
+            lastObservedTodayKey = currentToday
+            selectedDayKey = currentToday
+        }
         refreshUI()
-        uiHandler.postDelayed(tickRunnable, 15000L)
+        uiHandler.removeCallbacks(tickRunnable)
+        uiHandler.postDelayed(tickRunnable, 1000L)
     }
 
     override fun onPause() {
@@ -346,373 +541,95 @@ class MainActivity : Activity() {
             .setMessage("Все записанные дни будут удалены.")
             .setPositiveButton("Очистить") { _, _ ->
                 WifiStorage.clearAllHistory(this)
-                selectedDayKey = ""
+                selectedDayKey = WifiStorage.getTodayKey()
                 refreshUI()
             }
             .setNegativeButton("Отмена", null)
             .show()
     }
 
+    private fun formatHoursMins(totalSec: Int): String {
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        return String.format(Locale.US, "%dч %02dм", h, m)
+    }
+
     private fun refreshUI() {
         WifiStorage.syncState(this)
         val isOn = WifiStorage.isConnected(this)
         val days = WifiStorage.getAvailableDays(this)
-        val displayNames = days.mapIndexed { idx, key ->
-            val rawDate = key.removePrefix("day_")
-            if (idx == 0) "$rawDate (Сегодня)" else rawDate
-        }
-
-        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, displayNames) {
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getView(position, convertView, parent) as TextView
-                v.setTextColor(Color.parseColor("#0F172A"))
-                v.textSize = 15f
-                v.setPadding(12, 10, 12, 10)
-                return v
-            }
-
-            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getDropDownView(position, convertView, parent) as TextView
-                v.setTextColor(Color.parseColor("#0F172A"))
-                v.setBackgroundColor(
-                    if (position == daySpinner.selectedItemPosition) Color.parseColor("#CBD5E1")
-                    else Color.parseColor("#E2E8F0")
-                )
-                v.textSize = 15f
-                v.setPadding(24, 18, 24, 18)
-                return v
-            }
-        }
-        daySpinner.adapter = adapter
+        val todayKey = WifiStorage.getTodayKey()
 
         if (selectedDayKey.isEmpty() || !days.contains(selectedDayKey)) {
-            selectedDayKey = days.first()
-        } else {
-            daySpinner.setSelection(days.indexOf(selectedDayKey))
+            selectedDayKey = todayKey
         }
 
-        daySpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                selectedDayKey = days[pos]
-                updateDashboard(WifiStorage.isConnected(this@MainActivity), selectedDayKey == days.first())
+        val dateLabels = days.map { key ->
+            val rawDate = key.removePrefix("day_")
+            if (key == todayKey) "$rawDate (Сегодня)" else rawDate
+        }
+        val onHoursLabels = days.map { key ->
+            val sec = WifiStorage.getTotalOnSecondsForDay(this, key)
+            "ON: ${formatHoursMins(sec)}"
+        }
+
+        val adapter = object : BaseAdapter() {
+            override fun getCount(): Int = days.size
+            override fun getItem(position: Int): Any = days[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+
+            private fun buildRow(position: Int, isDropDown: Boolean): View {
+                val row = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    layoutParams = AbsListView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    if (isDropDown) {
+                        setPadding(24, 18, 24, 18)
+                        setBackgroundColor(
+                            if (position == daySpinner.selectedItemPosition) Color.parseColor("#CBD5E1")
+                            else Color.parseColor("#E2E8F0")
+                        )
+                    } else {
+                        setPadding(12, 10, 12, 10)
+                    }
+                }
+
+                val leftDate = TextView(this@MainActivity).apply {
+                    text = dateLabels[position]
+                    setTextColor(Color.parseColor("#0F172A"))
+                    textSize = 15f
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                }
+
+                val rightHours = TextView(this@MainActivity).apply {
+                    text = onHoursLabels[position]
+                    setTextColor(Color.parseColor("#065F46"))
+                    textSize = 14f
+                    paint.isFakeBoldText = true
+                    gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                    setPadding(16, 0, 0, 0)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                }
+
+                row.addView(leftDate)
+                row.addView(rightHours)
+                return row
             }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
 
-        updateDashboard(isOn, selectedDayKey == days.first())
-    }
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                return buildRow(position, false)
+            }
 
-    private fun updateDashboard(isOn: Boolean, isToday: Boolean) {
-        val intervals = WifiStorage.getIntervalsForDay(this, selectedDayKey)
-        dashboardView.setData(intervals, isOn, isToday)
-    }
-}
-
-class DashboardChartView(context: Context) : View(context) {
-    private var intervals: List<IntArray> = emptyList()
-    private var isOnNow: Boolean = false
-    private var isToday: Boolean = true
-
-    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#1E293B")
-        style = Paint.Style.FILL
-    }
-    private val redOffPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#EF4444")
-        style = Paint.Style.FILL
-    }
-    private val greenOnPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#10B981")
-        style = Paint.Style.FILL
-    }
-    private val ringBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#1E293B")
-        style = Paint.Style.STROKE
-    }
-    private val activeRingBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#334155")
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-    }
-    private val greenArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#10B981")
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.BUTT
-    }
-    private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#64748B")
-        strokeWidth = 2.5f
-    }
-    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#CBD5E1")
-        textAlign = Paint.Align.CENTER
-    }
-    private val statusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textAlign = Paint.Align.LEFT
-        isFakeBoldText = true
-    }
-    private val statsPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#E2E8F0")
-        textAlign = Paint.Align.RIGHT
-        isFakeBoldText = true
-    }
-    private val centerStatusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textAlign = Paint.Align.CENTER
-        isFakeBoldText = true
-    }
-
-    // Контур и заливка для активной часовой стрелки
-    private val handOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#090D16")
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val handOutlineCirclePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#090D16")
-        style = Paint.Style.FILL
-    }
-    private val handPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val handCenterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
-
-    private val rect = RectF()
-    private val arcRect = RectF()
-
-    fun setData(newIntervals: List<IntArray>, connected: Boolean, todayFlag: Boolean) {
-        intervals = newIntervals
-        isOnNow = connected
-        isToday = todayFlag
-        invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val w = width.toFloat()
-        val h = height.toFloat()
-        if (w <= 0f || h <= 0f) return
-
-        val cal = Calendar.getInstance()
-        val nowSec = cal.get(Calendar.HOUR_OF_DAY) * 3600 +
-                cal.get(Calendar.MINUTE) * 60 +
-                cal.get(Calendar.SECOND)
-
-        val elapsedSec = if (isToday) nowSec.coerceIn(0, 86400) else 86400
-
-        var totalOnSec = 0
-        for (pair in intervals) {
-            val s = pair[0].coerceIn(0, elapsedSec)
-            val e = pair[1].coerceIn(0, elapsedSec)
-            if (e > s) totalOnSec += (e - s)
-        }
-        val totalOffSec = (elapsedSec - totalOnSec).coerceAtLeast(0)
-
-        // ================= 1. ВЕРХНИЙ ПРЯМОЛИНЕЙНЫЙ ГРАФИК (0..24, ~1/4 экрана) =================
-        val topAreaHeight = h * 0.25f
-        val padX = (w * 0.03f).coerceAtLeast(24f)
-        val barLeft = padX
-        val barRight = w - padX
-        val barWidth = (barRight - barLeft).coerceAtLeast(100f)
-
-        statusPaint.textSize = (topAreaHeight * 0.19f).coerceIn(24f, 44f)
-        statsPaint.textSize = (topAreaHeight * 0.15f).coerceIn(20f, 34f)
-        labelPaint.textSize = (topAreaHeight * 0.13f).coerceIn(18f, 30f)
-
-        val headerY = topAreaHeight * 0.24f
-
-        statusPaint.color = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
-        canvas.drawText(if (isOnNow) "● ON" else "● OFF", barLeft, headerY, statusPaint)
-
-        if (!isToday) {
-            val onH = totalOnSec / 3600
-            val onM = (totalOnSec % 3600) / 60
-            val offH = totalOffSec / 3600
-            val offM = (totalOffSec % 3600) / 60
-            val onPct = ((totalOnSec / 86400f) * 100f).toInt()
-            val statsText = "24ч итог — ON: ${onH}ч ${onM}м ($onPct%)  |  OFF: ${offH}ч ${offM}м"
-            canvas.drawText(statsText, barRight, headerY, statsPaint)
-        }
-
-        val barTop = topAreaHeight * 0.36f
-        val barBottom = topAreaHeight * 0.68f
-
-        rect.set(barLeft, barTop, barRight, barBottom)
-        canvas.drawRoundRect(rect, 8f, 8f, trackPaint)
-
-        if (elapsedSec > 0) {
-            val elapsedRight = barLeft + (elapsedSec / 86400f) * barWidth
-            rect.set(barLeft, barTop, elapsedRight, barBottom)
-            canvas.drawRect(rect, redOffPaint)
-        }
-
-        for (pair in intervals) {
-            val x1 = barLeft + (pair[0] / 86400f) * barWidth
-            val x2 = barLeft + (pair[1] / 86400f) * barWidth
-            if (x2 > x1) {
-                rect.set(x1, barTop, max(x2, x1 + 2f), barBottom)
-                canvas.drawRect(rect, greenOnPaint)
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                return buildRow(position, true)
             }
         }
 
-        val tickBottom = barBottom + (topAreaHeight * 0.08f)
-        val textY = tickBottom + labelPaint.textSize * 1.05f
-        for (hour in 0..24) {
-            val x = barLeft + (hour / 24f) * barWidth
-            val isMajor = hour % 6 == 0
-            tickPaint.strokeWidth = if (isMajor) 3.5f else 2f
-            tickPaint.color = if (isMajor) Color.parseColor("#94A3B8") else Color.parseColor("#475569")
-            canvas.drawLine(x, barBottom, x, tickBottom, tickPaint)
-
-            if (w >= 700f || hour % 2 == 0) {
-                canvas.drawText(hour.toString(), x, textY, labelPaint)
-            }
-        }
-
-        // ================= 2. ДВА КРУГЛЫХ ЧАСОВЫХ ГРАФИКА РЯДОМ =================
-        val bottomTop = topAreaHeight + 8f
-        val bottomHeight = h - bottomTop
-        val halfW = w / 2f
-
-        val isFirstHalfActive = isToday && (nowSec < 43200)
-        val isSecondHalfActive = isToday && (nowSec >= 43200)
-
-        // Левые часы (разметка 1..12)
-        drawClockDial(
-            canvas = canvas,
-            cx = halfW * 0.5f,
-            cy = bottomTop + bottomHeight * 0.52f,
-            availableW = halfW,
-            availableH = bottomHeight,
-            periodStartSec = 0,
-            periodEndSec = 43200,
-            isSecondHalf = false,
-            isActiveClock = isFirstHalfActive,
-            nowSec = nowSec
-        )
-
-        // Правые часы (разметка 13..24)
-        drawClockDial(
-            canvas = canvas,
-            cx = halfW * 1.5f,
-            cy = bottomTop + bottomHeight * 0.52f,
-            availableW = halfW,
-            availableH = bottomHeight,
-            periodStartSec = 43200,
-            periodEndSec = 86400,
-            isSecondHalf = true,
-            isActiveClock = isSecondHalfActive,
-            nowSec = nowSec
-        )
-    }
-
-    private fun drawClockDial(
-        canvas: Canvas,
-        cx: Float,
-        cy: Float,
-        availableW: Float,
-        availableH: Float,
-        periodStartSec: Int,
-        periodEndSec: Int,
-        isSecondHalf: Boolean,
-        isActiveClock: Boolean,
-        nowSec: Int
-    ) {
-        val minDim = min(availableW, availableH)
-        val strokeW = (minDim * 0.11f).coerceIn(20f, 60f)
-        val radius = (minDim * 0.5f) - strokeW * 1.45f
-        if (radius <= 20f) return
-
-        ringBgPaint.strokeWidth = strokeW
-        greenArcPaint.strokeWidth = strokeW
-        labelPaint.textSize = (minDim * 0.045f).coerceIn(18f, 34f)
-        centerStatusPaint.textSize = (minDim * 0.052f).coerceIn(20f, 38f)
-
-        arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius)
-
-        // Тёмное базовое кольцо
-        canvas.drawOval(arcRect, ringBgPaint)
-
-        // Зелёные дуги ON
-        for (pair in intervals) {
-            val s = max(pair[0], periodStartSec)
-            val e = min(pair[1], periodEndSec)
-            if (e > s) {
-                val startAngle = -90f + ((s - periodStartSec) / 43200f) * 360f
-                val sweepAngle = ((e - s) / 43200f) * 360f
-                canvas.drawArc(arcRect, startAngle, sweepAngle.coerceAtLeast(0.8f), false, greenArcPaint)
-            }
-        }
-
-        if (isActiveClock) {
-            canvas.drawCircle(cx, cy, radius + strokeW * 0.56f, activeRingBorderPaint)
-        }
-
-        // Деления и цифры: 1..12 на левом, 13..24 на правом
-        val innerR = radius - strokeW / 2f
-        val outerR = radius + strokeW / 2f
-        val textR = outerR + strokeW * 0.55f
-
-        for (h in 0 until 12) {
-            val deg = -90.0 + h * 30.0
-            val rad = Math.toRadians(deg)
-            val cosA = cos(rad).toFloat()
-            val sinA = sin(rad).toFloat()
-
-            tickPaint.strokeWidth = if (h % 3 == 0) 4f else 2f
-            tickPaint.color = if (h % 3 == 0) Color.parseColor("#94A3B8") else Color.parseColor("#334155")
-            canvas.drawLine(
-                cx + innerR * cosA,
-                cy + innerR * sinA,
-                cx + outerR * cosA,
-                cy + outerR * sinA,
-                tickPaint
-            )
-
-            val hourStr = if (!isSecondHalf) {
-                if (h == 0) "12" else h.toString()
-            } else {
-                if (h == 0) "24" else (h + 12).toString()
-            }
-
-            val textOffsetY = (labelPaint.descent() + labelPaint.ascent()) / 2f
-            canvas.drawText(hourStr, cx + textR * cosA, cy + textR * sinA - textOffsetY, labelPaint)
-        }
-
-        // Активная стрелка с тёмной обводкой (контуром), чтобы не сливалась с зелёной шкалой
-        if (isActiveClock) {
-            val localSec = (nowSec - periodStartSec).coerceIn(0, 43200)
-            val handDeg = -90.0 + (localSec / 43200.0) * 360.0
-            val handRad = Math.toRadians(handDeg)
-
-            val handColor = if (isOnNow) Color.parseColor("#10B981") else Color.parseColor("#EF4444")
-            val handWidth = (strokeW * 0.24f).coerceIn(7f, 15f)
-            val outlineExtra = (strokeW * 0.16f).coerceIn(5f, 10f)
-            val centerRadius = (strokeW * 0.32f).coerceIn(10f, 18f)
-
-            handOutlinePaint.strokeWidth = handWidth + outlineExtra
-            handPaint.color = handColor
-            handPaint.strokeWidth = handWidth
-            handCenterPaint.color = handColor
-
-            // Кончик стрелки заходит на середину кольца, а тёмный контур отделяет её от зелёной дуги
-            val handLength = radius
-            val tipX = cx + handLength * cos(handRad).toFloat()
-            val tipY = cy + handLength * sin(handRad).toFloat()
-
-            // Статус ON / OFF внутри активного циферблата
-            centerStatusPaint.color = handColor
-            canvas.drawText(if (isOnNow) "ON" else "OFF", cx, cy - radius * 0.32f, centerStatusPaint)
-
-            // 1. Рисуем тёмный контур стрелки и центрального кружка
-            canvas.drawLine(cx, cy, tipX, tipY, handOutlinePaint)
-            canvas.drawCircle(cx, cy, centerRadius + outlineExtra * 0.55f, handOutlineCirclePaint)
-
-            // 2. Рисуем саму цветную стрелку поверх тёмного контура
-            canvas.drawLine(cx, cy, tipX, tipY, handPaint)
-            canvas.drawCircle(cx, cy, centerRadius, handCenterPaint)
-        }
-    }
-}
+        daySpinner.adapter = adapter
